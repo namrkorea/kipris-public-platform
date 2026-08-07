@@ -179,7 +179,7 @@ begin
   from normalized n
   cross join public.collection_jobs j
   where j.id = p_job_id
-  on conflict (application_number) do update
+  on conflict on constraint patents_application_number_key do update
   set
     invention_title = coalesce(excluded.invention_title, public.patents.invention_title),
     applicant_name = coalesce(excluded.applicant_name, public.patents.applicant_name),

@@ -1,5 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -7,6 +7,9 @@ export const maxDuration = 60;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_COMPARE_PATENTS = 10;
+const MAX_PDF_FILES = 6;
+const MAX_SINGLE_PDF_BYTES = 12_000_000;
+const MAX_TOTAL_PDF_BYTES = 30_000_000;
 
 function serverConfig() {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
@@ -19,11 +22,10 @@ function serverConfig() {
   if (!openaiApiKey) {
     throw new Error("OPENAI_API_KEY가 설정되지 않았습니다.");
   }
-
   return { supabaseUrl, secretKey, openaiApiKey };
 }
 
-function createServerClient(supabaseUrl: string, secretKey: string) {
+function createServerClient(supabaseUrl, secretKey) {
   return createClient(supabaseUrl, secretKey, {
     auth: {
       persistSession: false,
@@ -33,37 +35,37 @@ function createServerClient(supabaseUrl: string, secretKey: string) {
   });
 }
 
-function normalizePatentRelation(value: unknown): Record<string, unknown> | null {
+function normalizePatentRelation(value) {
   if (Array.isArray(value)) {
     const first = value[0];
-    return first && typeof first === "object"
-      ? (first as Record<string, unknown>)
-      : null;
+    return first && typeof first === "object" ? first : null;
   }
-  return value && typeof value === "object"
-    ? (value as Record<string, unknown>)
-    : null;
+  return value && typeof value === "object" ? value : null;
 }
 
-function extractResponseText(value: unknown): string {
+function extractResponseText(value) {
   if (!value || typeof value !== "object") return "";
-  const response = value as Record<string, unknown>;
-  if (typeof response.output_text === "string") return response.output_text;
+  if (typeof value.output_text === "string") return value.output_text;
+  if (!Array.isArray(value.output)) return "";
 
-  if (!Array.isArray(response.output)) return "";
-  for (const item of response.output) {
-    if (!item || typeof item !== "object") continue;
-    const content = (item as Record<string, unknown>).content;
-    if (!Array.isArray(content)) continue;
-    for (const part of content) {
-      if (!part || typeof part !== "object") continue;
-      const record = part as Record<string, unknown>;
-      if (record.type === "output_text" && typeof record.text === "string") {
-        return record.text;
+  for (const item of value.output) {
+    if (!item || typeof item !== "object" || !Array.isArray(item.content)) continue;
+    for (const part of item.content) {
+      if (
+        part &&
+        typeof part === "object" &&
+        part.type === "output_text" &&
+        typeof part.text === "string"
+      ) {
+        return part.text;
       }
     }
   }
   return "";
+}
+
+function safeText(value) {
+  return typeof value === "string" ? value : "";
 }
 
 const comparisonSchema = {
@@ -71,14 +73,8 @@ const comparisonSchema = {
   additionalProperties: false,
   properties: {
     overall_summary: { type: "string" },
-    common_technologies: {
-      type: "array",
-      items: { type: "string" },
-    },
-    key_differences: {
-      type: "array",
-      items: { type: "string" },
-    },
+    common_technologies: { type: "array", items: { type: "string" } },
+    key_differences: { type: "array", items: { type: "string" } },
     items: {
       type: "array",
       items: {
@@ -106,6 +102,27 @@ const comparisonSchema = {
         ],
       },
     },
+    claim_comparison: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          patent_id: { type: "string" },
+          source_basis: { type: "string" },
+          independent_claim_focus: { type: "string" },
+          key_elements: { type: "array", items: { type: "string" } },
+          differences_vs_others: { type: "string" },
+        },
+        required: [
+          "patent_id",
+          "source_basis",
+          "independent_claim_focus",
+          "key_elements",
+          "differences_vs_others",
+        ],
+      },
+    },
     similar_pairs: {
       type: "array",
       items: {
@@ -129,10 +146,11 @@ const comparisonSchema = {
         ],
       },
     },
-    review_notes: {
+    novelty_inventive_step_notes: {
       type: "array",
       items: { type: "string" },
     },
+    review_notes: { type: "array", items: { type: "string" } },
     limitations: { type: "string" },
   },
   required: [
@@ -140,29 +158,24 @@ const comparisonSchema = {
     "common_technologies",
     "key_differences",
     "items",
+    "claim_comparison",
     "similar_pairs",
+    "novelty_inventive_step_notes",
     "review_notes",
     "limitations",
   ],
-} as const;
+};
 
-export async function POST(
-  request: NextRequest,
-  context: { params: Promise<{ id: string }> },
-) {
+export async function POST(request, context) {
   try {
     const { id } = await context.params;
-    const body = (await request.json()) as {
-      token?: unknown;
-      patentIds?: unknown;
-    };
+    const body = await request.json();
     const token = typeof body.token === "string" ? body.token.trim() : "";
     const patentIds = Array.isArray(body.patentIds)
       ? Array.from(
           new Set(
             body.patentIds.filter(
-              (value): value is string =>
-                typeof value === "string" && UUID_PATTERN.test(value),
+              (value) => typeof value === "string" && UUID_PATTERN.test(value),
             ),
           ),
         )
@@ -234,7 +247,7 @@ export async function POST(
       );
     }
 
-    const patents = (rows ?? [])
+    const patents = (rows || [])
       .map((row) => {
         const patent = normalizePatentRelation(row.patents);
         return patent
@@ -245,7 +258,7 @@ export async function POST(
             }
           : null;
       })
-      .filter((row): row is NonNullable<typeof row> => row !== null);
+      .filter(Boolean);
 
     if (patents.length !== patentIds.length) {
       return NextResponse.json(
@@ -254,14 +267,117 @@ export async function POST(
       );
     }
 
+    const { data: documents, error: documentError } = await supabase
+      .from("patent_documents")
+      .select("patent_id,storage_bucket,storage_path,original_name,byte_size")
+      .in("patent_id", patentIds)
+      .eq("document_type", "publication_pdf");
+
+    if (documentError) {
+      console.warn("AI comparison PDF metadata lookup failed:", documentError.message);
+    }
+
+    const documentByPatentId = new Map();
+    for (const document of documents || []) {
+      if (document && document.patent_id) {
+        documentByPatentId.set(String(document.patent_id), document);
+      }
+    }
+
+    const pdfInputs = [];
+    let totalPdfBytes = 0;
+
+    for (const patent of patents) {
+      if (pdfInputs.length >= MAX_PDF_FILES) break;
+
+      const patentId = String(patent.patent_id);
+      const document = documentByPatentId.get(patentId);
+      if (!document) continue;
+
+      const byteSize = Number(document.byte_size || 0);
+      if (
+        !Number.isFinite(byteSize) ||
+        byteSize <= 0 ||
+        byteSize > MAX_SINGLE_PDF_BYTES ||
+        totalPdfBytes + byteSize > MAX_TOTAL_PDF_BYTES
+      ) {
+        continue;
+      }
+
+      const bucket = safeText(document.storage_bucket);
+      const storagePath = safeText(document.storage_path);
+      if (!bucket || !storagePath) continue;
+
+      const signedResult = await supabase.storage
+        .from(bucket)
+        .createSignedUrl(storagePath, 600);
+      const signedUrl = signedResult.data?.signedUrl;
+      if (signedResult.error || !signedUrl) {
+        console.warn(
+          "AI comparison PDF signed URL failed:",
+          patentId,
+          signedResult.error?.message || "signed URL missing",
+        );
+        continue;
+      }
+
+      pdfInputs.push({
+        patent_id: patentId,
+        application_number: safeText(patent.application_number),
+        title: safeText(patent.invention_title) || "제목 없음",
+        file_url: signedUrl,
+        byte_size: byteSize,
+      });
+      totalPdfBytes += byteSize;
+    }
+
+    const pdfPatentIds = new Set(pdfInputs.map((item) => item.patent_id));
+    const patentsForPrompt = patents.map((patent) => ({
+      ...patent,
+      public_pdf_attached: pdfPatentIds.has(String(patent.patent_id)),
+    }));
+
     const instructions = [
       "당신은 특허 기술 비교를 돕는 분석 보조자입니다.",
-      "반드시 제공된 서지정보, IPC, 초록만 근거로 한국어로 분석하세요.",
-      "청구항 원문이 제공되지 않았으므로 침해, 무효, 권리범위에 대한 법률적 결론을 내리지 마세요.",
-      "유사도 점수는 초록의 기술 내용과 IPC의 근접성을 바탕으로 한 예비 기술 유사도이며 법률적 유사도 점수가 아닙니다.",
+      "반드시 제공된 서지정보, IPC, 초록 및 첨부된 공개공보 PDF만 근거로 한국어로 분석하세요.",
+      "PDF가 첨부된 특허는 공개공보의 청구항을 우선 확인하여 독립청구항의 핵심 구성요소와 중요한 종속청구항의 한정요소를 비교하세요.",
+      "PDF가 첨부되지 않은 특허는 청구항 원문을 추정하지 말고 초록·IPC 기반 보완 분석이라고 명확히 표시하세요.",
+      "청구항 문구를 길게 복사하지 말고 핵심 구성요소를 요약하세요.",
+      "침해, 무효, 권리범위 확정 같은 법률적 결론을 내리지 마세요.",
+      "신규성·진보성 항목은 선행기술 조사 시 확인할 기술적 검토 포인트만 제시하고 법적 판단으로 표현하지 마세요.",
+      "유사도 점수는 기술적 근접성을 나타내는 참고값이며 법률적 유사도 점수가 아닙니다.",
       "각 특허의 핵심 기술과 차별점을 구체적으로 적고, 서로 유사도가 높은 조합을 우선 제시하세요.",
       "근거가 부족한 내용은 추정하지 말고 한계에 명시하세요.",
-    ].join("\n");
+    ].join(String.fromCharCode(10));
+
+    const inputContent = [
+      {
+        type: "input_text",
+        text: JSON.stringify(
+          {
+            task: "선택 특허 기술 및 청구항 비교",
+            search_query: job.query_text,
+            report_title: job.report_title,
+            review_purpose: job.review_purpose,
+            pdf_claim_source_count: pdfInputs.length,
+            patents: patentsForPrompt,
+          },
+          null,
+          2,
+        ),
+      },
+    ];
+
+    for (const pdf of pdfInputs) {
+      inputContent.push({
+        type: "input_text",
+        text: `다음 공개공보 PDF는 patent_id=${pdf.patent_id}, 출원번호=${pdf.application_number}, 발명의 명칭=${pdf.title} 입니다. 이 PDF의 청구항을 해당 특허와 정확히 연결해 분석하세요.`,
+      });
+      inputContent.push({
+        type: "input_file",
+        file_url: pdf.file_url,
+      });
+    }
 
     const openaiResponse = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -273,22 +389,17 @@ export async function POST(
         model: "gpt-5-mini",
         store: false,
         instructions,
-        input: JSON.stringify(
+        input: [
           {
-            task: "선택 특허 기술 비교",
-            search_query: job.query_text,
-            report_title: job.report_title,
-            review_purpose: job.review_purpose,
-            patents,
+            role: "user",
+            content: inputContent,
           },
-          null,
-          2,
-        ),
-        max_output_tokens: 5000,
+        ],
+        max_output_tokens: 6500,
         text: {
           format: {
             type: "json_schema",
-            name: "patent_comparison",
+            name: "patent_claim_comparison",
             strict: true,
             schema: comparisonSchema,
           },
@@ -300,17 +411,17 @@ export async function POST(
     if (!openaiResponse.ok) {
       const errorText = await openaiResponse.text();
       console.error(
-        "OpenAI patent comparison failed:",
+        "OpenAI claim comparison failed:",
         openaiResponse.status,
         errorText.slice(0, 1000),
       );
       return NextResponse.json(
-        { error: "GPT-5 mini 분석 요청에 실패했습니다." },
+        { error: "GPT-5 mini 청구항 분석 요청에 실패했습니다." },
         { status: 502 },
       );
     }
 
-    const openaiData = (await openaiResponse.json()) as unknown;
+    const openaiData = await openaiResponse.json();
     const responseText = extractResponseText(openaiData);
     if (!responseText) {
       return NextResponse.json(
@@ -319,27 +430,36 @@ export async function POST(
       );
     }
 
-    let comparison: unknown;
+    let comparison;
     try {
       comparison = JSON.parse(responseText);
     } catch {
-      console.error("OpenAI comparison JSON parse failed.");
+      console.error("OpenAI claim comparison JSON parse failed.");
       return NextResponse.json(
         { error: "GPT-5 mini 비교 결과 형식을 읽지 못했습니다." },
         { status: 502 },
       );
     }
 
+    const analysisBasis =
+      pdfInputs.length >= 2
+        ? `공개공보 PDF 청구항 ${pdfInputs.length}/${patents.length}건 + 초록·IPC 보완 분석`
+        : pdfInputs.length === 1
+          ? `공개공보 PDF 청구항 1/${patents.length}건 + 초록·IPC 보완 분석`
+          : "초록·IPC 기반 예비 분석 · 저장된 공개공보 PDF 없음";
+
     return NextResponse.json(
       {
         model: "gpt-5-mini",
         compared_count: patents.length,
+        pdf_claim_count: pdfInputs.length,
+        analysis_basis: analysisBasis,
         comparison,
       },
       { headers: { "Cache-Control": "no-store" } },
     );
   } catch (caught) {
-    console.error("AI patent comparison failed:", caught);
+    console.error("AI claim comparison failed:", caught);
     return NextResponse.json(
       { error: "AI 비교 서버 처리 중 오류가 발생했습니다." },
       { status: 500 },
